@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 import lmrax.optimizers
 from lmrax.datasets.preference_feedback import FlaxDataCollatorForSeq2SeqPF
 from lmrax.datasets.utils import seed_worker
+from lmrax.early_stopping import EarlyStopping, EarlyStoppingMode
 from lmrax.sharding import get_batch_shardings, get_params_shardings
 
 
@@ -157,7 +158,10 @@ class Trainer:
         self.params_shardings = None
         self.state_shardings = None
 
-        import jax.sharding as shd
+        self.early_stopping = EarlyStopping(
+            patience=cfg.patience,
+            maximize=True,
+        )
 
         devices = np.array(jax.devices()).reshape(
             cfg.num_dp_devices, cfg.num_tp_devices
@@ -195,9 +199,6 @@ class Trainer:
             shuffle=shuffle,
         )
 
-    def update_updates(self):
-        self.params_updates = self.steps // self.cfg.gradient_accumulation
-
     def train_epoch(self, params, state, rng):
         with tqdm.tqdm(self.train_loader, desc=f"Epoch {self.epoch}") as bar:
             for batch in bar:
@@ -207,7 +208,7 @@ class Trainer:
                 loss, params, state, grad_norm, rng = self.update_fn(
                     rng, batch, params, state
                 )
-                self.update_updates()
+
                 post_fix = {
                     "loss": jax.device_get(loss).mean(),
                     "grad_norm": jax.device_get(grad_norm).mean(),
@@ -215,29 +216,31 @@ class Trainer:
                 bar.set_postfix(post_fix)
 
                 if self.steps % self.cfg.gradient_accumulation == 0:
+                    self.params_updates += 1
                     wandb.log(
                         {"train/" + k: v for k, v in post_fix.items()},
                         step=self.params_updates,
                     )
                     if self.params_updates % self.cfg.save_steps == 0:
-                        os.makedirs(self.cfg.save_dir, exist_ok=True)
-                        self.model.save_pretrained(
-                            os.path.join(
-                                self.cfg.save_dir,
-                                f"model_{self.params_updates}",
-                            ),
-                            params=params,
-                            push_to_hub=False,
-                        )
+                        self.save(params, f"model_{self.params_updates}")
                     if self.params_updates % self.cfg.eval_steps == 0:
                         results = self.evaluate(params)
                         wandb.log(
                             {"val/" + k: v for k, v in results.items()},
                             step=self.params_updates,
                         )
-                        print(results)
+                        es_mode = self.early_stopping(results["acc"])
+                        if es_mode == EarlyStoppingMode.STOP:
+                            return True, params, state, rng
+                        elif es_mode == EarlyStoppingMode.BEST:
+                            self.save(
+                                params,
+                                f"model_best_acc_{results['acc']:.4f}",
+                            )
+                    if self.params_updates % self.cfg.max_updates == 0:
+                        return True, params, state, rng
 
-        return params, state, rng
+        return False, params, state, rng
 
     def init(self, params):
         batch = next(iter(self.train_loader))
@@ -315,10 +318,24 @@ class Trainer:
 
         return params, state
 
+    def save(self, params, name):
+        os.makedirs(self.cfg.save_dir, exist_ok=True)
+        self.model.save_pretrained(
+            os.path.join(self.cfg.save_dir, name),
+            params=params,
+            push_to_hub=False,
+        )
+        self.tokenizer.save_pretrained(
+            os.path.join(self.cfg.save_dir, name),
+            push_to_hub=False,
+        )
+
     def train(self, params, state, rng):
-        for i in range(self.cfg.epochs):
+        for i in range(self.cfg.max_epochs):
             self.epoch += 1
-            params, state, rng = self.train_epoch(params, state, rng)
+            finished, params, state, rng = self.train_epoch(params, state, rng)
+            if finished:
+                break
 
     def evaluate(self, params):
         avg_loss = 0.0
@@ -415,4 +432,12 @@ def main(cfg):
 
 
 if __name__ == "__main__":
+    """
+    Alternatively, use ```
+    jax.config.update("jax_threefry_partitionable", True)
+    ``` to reduce the communication overhead.
+    """
+
+    jax.config.update("jax_default_prng_impl", "rbg")
+
     main()
