@@ -278,7 +278,7 @@ class Trainer:
                     step=self.params_updates,
                 )
 
-        return True, params, state, rng
+        return False, params, state, rng
 
     def init(self, params):
         batch = next(iter(self.train_loader))
