@@ -1,5 +1,4 @@
 name: "Anthropic/hh-rlhf"
-train: train[:90%]
-val: train[90%:]
-test: "test"
-score_ratio: 2.0
+train: train
+val: test
+test: null
