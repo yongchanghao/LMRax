@@ -288,6 +288,7 @@ class Trainer:
 
         params = jax.tree_map(np.asarray, params)
         params_shardings = freeze(get_params_shardings(self.mesh, params))
+        params = jax.device_put(params, params_shardings)
         batch_shardings = get_batch_shardings(self.mesh, batch)
 
         state = self.optimizer.init(params)
