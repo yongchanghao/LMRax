@@ -64,6 +64,9 @@ def predict_fn(params, batch, model, rng=None):
         dropout_rng=rejected_rng,
     ).last_hidden_state.mean(axis=-1)
 
+    chosen_reward = jnp.tanh(chosen_reward)  # (B, L)
+    rejected_reward = jnp.tanh(rejected_reward)  # (B, L)
+
     # mask out paddings
     chosen_reward = jnp.where(
         chosen["attention_mask"] == 0, 0.0, chosen_reward
@@ -227,7 +230,6 @@ class Trainer:
             collate_fn=self.get_data_collator(),
             pin_memory=False,
             drop_last=drop_last,
-            num_workers=mp.cpu_count(),
             worker_init_fn=seed_worker,
             shuffle=shuffle,
         )
@@ -235,24 +237,6 @@ class Trainer:
     def train_epoch(self, params, state, rng):
         with tqdm.tqdm(self.train_loader, desc=f"Epoch {self.epoch}") as bar:
             for batch in bar:
-                if self.params_updates % self.cfg.save_steps == 0:
-                    self.save(params, f"model_{self.params_updates}")
-                if self.params_updates % self.cfg.eval_steps == 0:
-                    results = self.evaluate(params)
-                    wandb.log(
-                        {"val/" + k: v for k, v in results.items()},
-                        step=self.params_updates,
-                    )
-                    es_mode = self.early_stopping(results["acc"])
-                    if es_mode == EarlyStoppingMode.STOP:
-                        return True, params, state, rng
-                    elif es_mode == EarlyStoppingMode.BEST:
-                        self.save(
-                            params,
-                            f"model_best_acc_{results['acc']:.4f}",
-                        )
-                if self.params_updates >= self.cfg.max_updates:
-                    return True, params, state, rng
 
                 self.steps += 1
                 batch = batch_reshape(
@@ -277,6 +261,25 @@ class Trainer:
                     {"train/" + k: v for k, v in post_fix.items()},
                     step=self.params_updates,
                 )
+
+                if self.params_updates % self.cfg.save_steps == 0:
+                    self.save(params, f"model_{self.params_updates}")
+                if self.params_updates % self.cfg.eval_steps == 0:
+                    results = self.evaluate(params)
+                    wandb.log(
+                        {"val/" + k: v for k, v in results.items()},
+                        step=self.params_updates,
+                    )
+                    es_mode = self.early_stopping(results["acc"])
+                    if es_mode == EarlyStoppingMode.STOP:
+                        return True, params, state, rng
+                    elif es_mode == EarlyStoppingMode.BEST:
+                        self.save(
+                            params,
+                            f"model_best_acc_{results['acc']:.4f}",
+                        )
+                if self.params_updates >= self.cfg.max_updates:
+                    return True, params, state, rng
 
         return False, params, state, rng
 
@@ -396,6 +399,7 @@ class Trainer:
 
 @hydra.main(version_base=None, config_path="config", config_name="tp")
 def main(cfg):
+    seed_worker(cfg.seed)
     train_ds = datasets.load_dataset(cfg.dataset.name, split=cfg.dataset.train)
     ori_train_len = len(train_ds)
     train_ds = train_ds.filter(
@@ -473,7 +477,6 @@ if __name__ == "__main__":
     jax.config.update("jax_threefry_partitionable", True)
     ``` to reduce the communication overhead.
     """
-
     jax.config.update("jax_default_prng_impl", "rbg")
 
     main()
