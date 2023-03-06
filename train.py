@@ -105,7 +105,6 @@ def grad_fn(params, batch, rng, model):
 
 
 def _update_fn(model, optimizer, rng, batch, params, state, cfg=None):
-    params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
     grads = jax.tree_map(jnp.zeros_like, params)
     loss = 0.0
     acc = 0.0
@@ -125,16 +124,13 @@ def _update_fn(model, optimizer, rng, batch, params, state, cfg=None):
     )
 
     loss = loss.astype(jnp.float32) / cfg.gradient_accumulation
-    grads = jax.tree_map(
-        lambda x: x.astype(jnp.float32) / cfg.gradient_accumulation, grads
-    )
+    grads = jax.tree_map(lambda x: x / cfg.gradient_accumulation, grads)
     acc = acc.astype(jnp.float32) / cfg.gradient_accumulation
     grad_norm = grad_norm_fn(grads)
 
-    params = jax.tree_map(lambda x: x.astype(jnp.float32), params)
     updates, state = optimizer.update(grads, state, params)
     params = optax.apply_updates(params, updates)
-    return loss, acc, params, state, grad_norm, rng
+    return loss, acc, params, state, grad_norm
 
 
 def batch_select(batch, idx, axis=0):
@@ -143,7 +139,6 @@ def batch_select(batch, idx, axis=0):
 
 def _eval_fn(params, batch, model, cfg):
     bs = batch["weight"].shape[0]
-    params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
     loss, acc = loss_fn(params, batch, None, model)
     loss = loss.astype(jnp.float32)
     acc = acc.astype(jnp.float32)
@@ -243,8 +238,9 @@ class Trainer:
                     batch,
                     self.cfg.batch_size_per_device * self.cfg.num_dp_devices,
                 )
-
-                loss, acc, params, state, grad_norm, rng = self.update_fn(
+                _, rng = jax.random.split(rng)
+                # import ipdb; ipdb.set_trace()
+                loss, acc, params, state, grad_norm = self.update_fn(
                     rng, batch, params, state
                 )
 
@@ -289,6 +285,7 @@ class Trainer:
         params = jax.tree_map(np.asarray, params)
         params_shardings = freeze(get_params_shardings(self.mesh, params))
         params = jax.device_put(params, params_shardings)
+        params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
         batch_shardings = get_batch_shardings(self.mesh, batch)
 
         state = self.optimizer.init(params)
@@ -335,9 +332,7 @@ class Trainer:
                 params_shardings,  # params
                 state_shardings,  # state
                 none_shd,  # grad_norm
-                none_shd,  # rng
             ),
-            donate_argnums=(2, 3),
         )
 
         def wrapped_eval_fn(params, batch):
