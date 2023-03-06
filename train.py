@@ -239,7 +239,6 @@ class Trainer:
                     self.cfg.batch_size_per_device * self.cfg.num_dp_devices,
                 )
                 _, rng = jax.random.split(rng)
-                # import ipdb; ipdb.set_trace()
                 loss, acc, params, state, grad_norm = self.update_fn(
                     rng, batch, params, state
                 )
@@ -430,7 +429,6 @@ def main(cfg):
     elif cfg.max_grad_value is not None:
         optimizer_chains.append(optax.clip(cfg.max_grad_value))
     optimizer = optax.chain(*optimizer_chains)
-    # optimizer = optax.MultiSteps(optimizer, cfg.gradient_accumulation)
 
     rng = jax.random.PRNGKey(cfg.seed)
     model, params = transformers.FlaxAutoModel.from_pretrained(
