@@ -105,30 +105,37 @@ def grad_fn(params, batch, rng, model):
 
 
 def _update_fn(model, optimizer, rng, batch, params, state, cfg=None):
-    grads = jax.tree_map(jnp.zeros_like, params)
-    loss = 0.0
-    acc = 0.0
+    half_params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
+    updates = jax.tree_map(jnp.zeros_like, half_params)
 
     def _inner_update_fn(i, data):
         _loss, _acc, _grads, _rng = data
         _, _rng = jax.random.split(_rng)
         _batch = batch_select(batch, i, 1)
-        (__loss, __acc), __grads = grad_fn(params, _batch, _rng, model)
+        (__loss, __acc), __grads = grad_fn(half_params, _batch, _rng, model)
         _loss = _loss + __loss
         _acc = _acc + __acc
         _grads = jax.tree_map(lambda x, y: x + y, _grads, __grads)
         return _loss, _acc, _grads, _rng
 
-    loss, acc, grads, rng = jax.lax.fori_loop(
-        0, cfg.gradient_accumulation, _inner_update_fn, (loss, acc, grads, rng)
+    loss, acc, updates, rng = jax.lax.fori_loop(
+        0,
+        cfg.gradient_accumulation,
+        _inner_update_fn,
+        (0.0, 0.0, updates, rng),
     )
 
     loss = loss.astype(jnp.float32) / cfg.gradient_accumulation
-    grads = jax.tree_map(lambda x: x / cfg.gradient_accumulation, grads)
     acc = acc.astype(jnp.float32) / cfg.gradient_accumulation
-    grad_norm = grad_norm_fn(grads)
+    grad_norm = (
+        grad_norm_fn(updates).astype(jnp.float32) / cfg.gradient_accumulation
+    )
 
-    updates, state = optimizer.update(grads, state, params)
+    updates = jax.tree_map(
+        lambda x: x.astype(jnp.float32) / cfg.gradient_accumulation, updates
+    )
+
+    updates, state = optimizer.update(updates, state, params)
     params = optax.apply_updates(params, updates)
     return loss, acc, params, state, grad_norm
 
@@ -138,6 +145,7 @@ def batch_select(batch, idx, axis=0):
 
 
 def _eval_fn(params, batch, model, cfg):
+    params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
     bs = batch["weight"].shape[0]
     loss, acc = loss_fn(params, batch, None, model)
     loss = loss.astype(jnp.float32)
@@ -284,7 +292,6 @@ class Trainer:
         params = jax.tree_map(np.asarray, params)
         params_shardings = freeze(get_params_shardings(self.mesh, params))
         params = jax.device_put(params, params_shardings)
-        params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
         batch_shardings = get_batch_shardings(self.mesh, batch)
 
         state = self.optimizer.init(params)
@@ -432,8 +439,7 @@ def main(cfg):
 
     rng = jax.random.PRNGKey(cfg.seed)
     model, params = transformers.FlaxAutoModel.from_pretrained(
-        cfg.model_name,
-        _do_init=False,
+        cfg.model_name, _do_init=False, dtype=jnp.bfloat16
     )
     rng = jax.tree_map(np.asarray, rng)
     params = jax.tree_map(np.asarray, params)
