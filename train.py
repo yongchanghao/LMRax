@@ -14,6 +14,7 @@ import tqdm
 import transformers
 import wandb
 from flax.core.frozen_dict import freeze, unfreeze
+from flax.training.early_stopping import EarlyStopping
 from jax.experimental.pjit import pjit
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
@@ -21,7 +22,6 @@ from torch.utils.data import DataLoader
 import lmrax.optimizers
 from lmrax.datasets.preference_feedback import FlaxDataCollatorForSeq2SeqPF
 from lmrax.datasets.utils import seed_worker
-from lmrax.early_stopping import EarlyStopping, EarlyStoppingMode
 from lmrax.sharding import get_batch_shardings, get_params_shardings
 
 
@@ -158,9 +158,8 @@ class Trainer:
         self.params_shardings = None
         self.state_shardings = None
 
-        self.early_stopping = EarlyStopping(
+        self.es = EarlyStopping(
             patience=cfg.patience,
-            maximize=True,
         )
 
         devices = np.array(jax.devices()).reshape(
@@ -229,10 +228,11 @@ class Trainer:
                             {"val/" + k: v for k, v in results.items()},
                             step=self.params_updates,
                         )
-                        es_mode = self.early_stopping(results["acc"])
-                        if es_mode == EarlyStoppingMode.STOP:
+
+                        improved, self.es = self.es.update(-results["acc"])
+                        if self.es.should_stop:
                             return True, params, state, rng
-                        elif es_mode == EarlyStoppingMode.BEST:
+                        elif improved:
                             self.save(
                                 params,
                                 f"model_best_acc_{results['acc']:.4f}",
@@ -390,9 +390,11 @@ def main(cfg):
         optimizer_cls(**optimizer_cfg),
     ]
     if cfg.max_grad_norm is not None:
-        optimizer_chains.append(optax.clip_by_global_norm(cfg.max_grad_norm))
+        optimizer_chains.insert(
+            0, optax.clip_by_global_norm(cfg.max_grad_norm)
+        )
     elif cfg.max_grad_value is not None:
-        optimizer_chains.append(optax.clip(cfg.max_grad_value))
+        optimizer_chains.insert(0, optax.clip(cfg.max_grad_value))
     optimizer = optax.chain(*optimizer_chains)
     optimizer = optax.MultiSteps(optimizer, cfg.gradient_accumulation)
 
