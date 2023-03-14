@@ -61,8 +61,7 @@ def get_batch_shardings(mesh, inputs):
         if not isinstance(v, np.ndarray) or v.ndim == 0:
             _spec_tuple = []
         else:
-            _spec_tuple = [None] * (v.ndim)
-            _spec_tuple[0] = "dp"
+            _spec_tuple = ["dp"]
         p = shd.PartitionSpec(*_spec_tuple)
         return_dict[k] = shd.NamedSharding(mesh, p)
     return return_dict
