@@ -1,5 +1,7 @@
+import logging
 import multiprocessing as mp
 import os
+import pickle
 from functools import partial
 
 import datasets
@@ -22,7 +24,7 @@ from torch.utils.data import DataLoader
 import lmrax.optimizers
 from lmrax.datasets.preference_feedback import FlaxDataCollatorForSeq2SeqPF
 from lmrax.datasets.utils import seed_worker
-from lmrax.early_stopping import EarlyStopping, EarlyStoppingMode
+from lmrax.dir_manager import DirManager
 from lmrax.sharding import get_batch_shardings, get_params_shardings
 
 
@@ -138,7 +140,7 @@ def _update_fn(model, optimizer, rng, batch, params, state, cfg=None):
 
     updates, state = optimizer.update(updates, state, params)
     params = optax.apply_updates(params, updates)
-    return loss, acc, params, state, grad_norm
+    return loss, acc, params, state, grad_norm, rng
 
 
 def batch_select(batch, idx, axis=0):
@@ -176,10 +178,17 @@ def batch_reshape(batch, d0):
 
 
 class Trainer:
-    def __init__(self, cfg, model, tokenizer, train_ds, val_ds, optimizer):
+    def __init__(
+        self,
+        cfg,
+        optimizer,
+        train_ds,
+        val_ds,
+        update_fn,
+        eval_fn,
+    ):
+        self.logger = logging.getLogger(__name__)
         self.cfg = cfg
-        self.model = model
-        self.tokenizer = tokenizer
         self.train_ds = train_ds
         self.val_ds = val_ds
         self.optimizer = optimizer
@@ -194,11 +203,12 @@ class Trainer:
         self.eval_batch_size = cfg.batch_size_per_device * cfg.num_dp_devices
         self.max_length = cfg.max_length
 
-        self.params_shardings = None
-        self.state_shardings = None
-
         self.es = EarlyStopping(
             patience=cfg.patience,
+        )
+        self.rng = jax.tree_map(np.asarray, jax.random.PRNGKey(cfg.seed))
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+            cfg.model_name
         )
 
         devices = np.array(jax.devices()).reshape(
@@ -213,8 +223,108 @@ class Trainer:
             self.val_ds, batch_size=self.eval_batch_size, shuffle=False
         )
 
-        self.update_fn = None
-        self.eval_fn = None
+        self.dmgr = DirManager(cfg.save_dir, maximize=True)
+
+        if cfg.override:
+            self.logger.warning(
+                f"Overriding previous checkpoint under {cfg.save_dir}\n"
+                + f"Loading model from f{cfg.model_name}"
+            )
+            path = self.cfg.model_name
+        elif self.dmgr.last_model is not None:
+            self.logger.warning(
+                f"Loading previous checkpoint from {self.dmgr.last_model}"
+            )
+            path = self.dmgr.last_model
+        else:
+            self.logger.warning(f"Loading model from {self.cfg.model_name}")
+            path = self.cfg.model_name
+
+        self.model, params = transformers.FlaxAutoModel.from_pretrained(
+            path, _do_init=False, dtype=jnp.bfloat16
+        )
+
+        batch = next(iter(self.train_loader))
+
+        params = self.model.init_weights(
+            self.rng, (cfg.batch_size_per_device, cfg.max_length), params
+        )
+        params = jax.tree_map(np.asarray, params)
+
+        none_shd = shd.NamedSharding(self.mesh, shd.PartitionSpec())
+
+        params_shardings = freeze(get_params_shardings(self.mesh, params))
+        self.params = jax.device_put(params, params_shardings)
+        if cfg.reset_status or cfg.override:
+            self.logger.warning(f"Ignoring saved status under f{cfg.save_dir}")
+            self.state = self.optimizer.init(self.params)
+        elif self.dmgr.last_model is not None:
+            self.logger.info(f"Loading model from f{self.dmgr.last_model}")
+            self.load_status(self.dmgr.last_model)
+        else:
+            self.state = self.optimizer.init(self.params)
+
+        batch_shardings = get_batch_shardings(self.mesh, batch)
+
+        # TODO(yongchanghao): this is a hack
+        def get_state_shardings(x):
+            x = unfreeze(x)
+            if isinstance(x, dict):
+                return params_shardings
+            return shd.NamedSharding(self.mesh, shd.PartitionSpec())
+
+        state_shardings = jax.tree_util.tree_map(
+            get_state_shardings,
+            self.state,
+            is_leaf=lambda x: isinstance(
+                unfreeze(x), (dict, optax.EmptyState)
+            ),
+        )
+
+        self.state = jax.device_put(self.state, state_shardings)
+
+        def wrapped_update_fn(rng, batch, params, state):
+            return update_fn(
+                self.model,
+                self.optimizer,
+                rng,
+                batch,
+                params,
+                state,
+                cfg,
+            )
+
+        def wrapped_eval_fn(params, batch):
+            return eval_fn(
+                params,
+                batch,
+                self.model,
+                cfg,
+            )
+
+        self.update_fn = pjit(
+            wrapped_update_fn,
+            in_axis_resources=(
+                none_shd,  # rng
+                batch_shardings,  # batch
+                params_shardings,  # params
+                state_shardings,  # state
+            ),
+            out_axis_resources=(
+                none_shd,  # loss
+                none_shd,  # acc
+                params_shardings,  # params
+                state_shardings,  # state
+                none_shd,  # grad_norm
+                none_shd,  # rng
+            ),
+        )
+
+        self.eval_fn = pjit(
+            wrapped_eval_fn,
+            in_axis_resources=(params_shardings, batch_shardings),
+            out_axis_resources=(none_shd, none_shd),
+        )
 
     def get_data_collator(self):
         return FlaxDataCollatorForSeq2SeqPF(
@@ -237,19 +347,27 @@ class Trainer:
             shuffle=shuffle,
         )
 
-    def train_epoch(self, params, state, rng):
+    def train_epoch(self):
         with tqdm.tqdm(self.train_loader, desc=f"Epoch {self.epoch}") as bar:
-            for batch in bar:
-
+            iterator = iter(bar)
+            for _ in range(self.steps):
+                next(iterator)
+            for _ in range(self.steps, len(self.train_loader)):
+                batch = next(iterator)
                 self.steps += 1
                 batch = batch_reshape(
                     batch,
                     self.cfg.batch_size_per_device * self.cfg.num_dp_devices,
                 )
-                _, rng = jax.random.split(rng)
-                loss, acc, params, state, grad_norm = self.update_fn(
-                    rng, batch, params, state
-                )
+                # _, self.rng = jax.random.split(self.rng)
+                (
+                    loss,
+                    acc,
+                    self.params,
+                    self.state,
+                    grad_norm,
+                    self.rng,
+                ) = self.update_fn(self.rng, batch, self.params, self.state)
 
                 post_fix = {
                     "loss": jax.device_get(loss).mean(),
@@ -258,125 +376,92 @@ class Trainer:
                     "steps": self.params_updates,
                 }
                 bar.set_postfix(post_fix)
-
+                if self.steps % len(self.train_loader) == 0:
+                    self.epoch += 1
+                    self.steps = 0
                 self.params_updates += 1
                 wandb.log(
                     {"train/" + k: v for k, v in post_fix.items()},
                     step=self.params_updates,
                 )
-
-                if self.params_updates % self.cfg.save_steps == 0:
-                    self.save(params, f"model_{self.params_updates}")
                 if self.params_updates % self.cfg.eval_steps == 0:
-                    results = self.evaluate(params)
+                    results = self.evaluate()
                     wandb.log(
                         {"val/" + k: v for k, v in results.items()},
                         step=self.params_updates,
                     )
                     improved, self.es = self.es.update(-results["acc"])
                     if self.es.should_stop:
-                        return True, params, state, rng
+                        return True
                     elif improved:
                         self.save(
-                            params,
                             f"model_best_acc_{results['acc']:.4f}",
                         )
+                if self.params_updates % self.cfg.save_steps == 0:
+                    self.save(f"model_{self.params_updates}")
                 if self.params_updates >= self.cfg.max_updates:
-                    return True, params, state, rng
+                    return True
+        return False
 
-        return False, params, state, rng
+    def save(self, name):
+        def cast_to_fp32(param):
+            if isinstance(param, jnp.ndarray) and jnp.issubdtype(
+                param.dtype, jnp.floating
+            ):
+                param = param.astype(jnp.float32)
+            return np.asarray(param)
 
-    def init(self, params):
-        batch = next(iter(self.train_loader))
-
-        params = jax.tree_map(np.asarray, params)
-        params_shardings = freeze(get_params_shardings(self.mesh, params))
-        params = jax.device_put(params, params_shardings)
-        batch_shardings = get_batch_shardings(self.mesh, batch)
-
-        state = self.optimizer.init(params)
-
-        # TODO(yongchanghao): this is a hack
-        def get_state_shardings(x):
-            x = unfreeze(x)
-            if isinstance(x, dict):
-                return params_shardings
-            return shd.NamedSharding(self.mesh, shd.PartitionSpec())
-
-        state_shardings = jax.tree_util.tree_map(
-            get_state_shardings,
-            state,
-            is_leaf=lambda x: isinstance(
-                unfreeze(x), (dict, optax.EmptyState)
-            ),
-        )
-
-        def wrapped_update_fn(rng, batch, params, state):
-            return _update_fn(
-                self.model,
-                self.optimizer,
-                rng,
-                batch,
-                params,
-                state,
-                self.cfg,
-            )
-
-        none_shd = shd.NamedSharding(self.mesh, shd.PartitionSpec())
-
-        self.update_fn = pjit(
-            wrapped_update_fn,
-            in_axis_resources=(
-                none_shd,  # rng
-                batch_shardings,  # batch
-                params_shardings,  # params
-                state_shardings,  # state
-            ),
-            out_axis_resources=(
-                none_shd,  # loss
-                none_shd,  # acc
-                params_shardings,  # params
-                state_shardings,  # state
-                none_shd,  # grad_norm
-            ),
-        )
-
-        def wrapped_eval_fn(params, batch):
-            return _eval_fn(params, batch, self.model, self.cfg)
-
-        self.eval_fn = pjit(
-            wrapped_eval_fn,
-            in_axis_resources=(params_shardings, batch_shardings),
-            out_axis_resources=(none_shd, none_shd),
-        )
-
-        return params, state
-
-    def save(self, params, name):
-        os.makedirs(self.cfg.save_dir, exist_ok=True)
         self.model.save_pretrained(
             os.path.join(self.cfg.save_dir, name),
-            params=params,
+            params=self.params,
             push_to_hub=False,
         )
         self.tokenizer.save_pretrained(
             os.path.join(self.cfg.save_dir, name),
             push_to_hub=False,
         )
+        status_dict = {
+            "epoch": self.epoch,
+            "steps": self.steps,
+            "params_updates": self.params_updates,
+            "es": self.es,
+            "state": jax.tree_map(cast_to_fp32, self.state),
+        }
+        status_path = os.path.join(self.cfg.save_dir, name, "status.pkl")
+        with open(status_path, "wb") as f:
+            pickle.dump(status_dict, f)
 
-    def train(self, params, state, rng):
+        if os.path.exists(os.path.join(self.cfg.save_dir, "model_last")):
+            os.unlink(os.path.join(self.cfg.save_dir, "model_last"))
+        os.symlink(
+            os.path.abspath(os.path.join(self.cfg.save_dir, name)),
+            os.path.join(self.cfg.save_dir, "model_last"),
+        )
+        self.dmgr.purge_old(self.cfg.keep_last)
+        self.dmgr.purge_worse(self.cfg.keep_best)
+
+    def load_status(self, name):
+        status_path = os.path.join(self.cfg.save_dir, name, "status.pkl")
+        with open(status_path, "rb") as f:
+            status_dict = pickle.load(f)
+        self.epoch = status_dict["epoch"]
+        self.steps = status_dict["steps"]
+        self.params_updates = status_dict["params_updates"]
+        self.es = status_dict["es"]
+        self.state = status_dict["state"]
+
+    def train(self):
         for i in range(self.cfg.max_epochs):
-            self.epoch += 1
-            finished, params, state, rng = self.train_epoch(params, state, rng)
+            finished = self.train_epoch()
             if finished:
                 break
 
-    def evaluate(self, params):
+    def evaluate(self):
         avg_loss = 0.0
         avg_acc = 0.0
         with tqdm.tqdm(self.val_loader, desc="Evaluating") as bar:
             for batch in bar:
-                loss, acc = self.eval_fn(params, batch)
+                loss, acc = self.eval_fn(self.params, batch)
                 loss = jax.device_get(loss)
                 acc = jax.device_get(acc)
                 avg_loss += loss
@@ -415,8 +500,6 @@ def main(cfg):
         load_from_cache_file=False,
     )
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(cfg.model_name)
-
     val_ds = datasets.load_dataset(cfg.dataset.name, split=cfg.dataset.val)
     ori_val_len = len(val_ds)
     val_ds = val_ds.map(
@@ -439,26 +522,17 @@ def main(cfg):
         optimizer_chains.insert(0, optax.clip(cfg.max_grad_value))
     optimizer = optax.chain(*optimizer_chains)
 
-    rng = jax.random.PRNGKey(cfg.seed)
-    model, params = transformers.FlaxAutoModel.from_pretrained(
-        cfg.model_name, _do_init=False, dtype=jnp.bfloat16
-    )
-    rng = jax.tree_map(np.asarray, rng)
-    params = jax.tree_map(np.asarray, params)
-    params = model.init_weights(rng, (1, 1), params)
-
     trainer = Trainer(
         cfg=cfg,
-        model=model,
-        tokenizer=tokenizer,
+        optimizer=optimizer,
         train_ds=train_ds,
         val_ds=val_ds,
-        optimizer=optimizer,
+        update_fn=_update_fn,
+        eval_fn=_eval_fn,
     )
-
-    params, state = trainer.init(params)
     num_params = jax.tree_util.tree_reduce(
-        lambda x, y: x + y, jax.tree_map(lambda x: x.size, params)
+        lambda x, y: x + y,
+        jax.tree_map(lambda x: x.size, trainer.params),
     )
     wandb.init(project="pf", config=OmegaConf.to_object(cfg), dir=cfg.save_dir)
     wandb.define_metric("val/loss", summary="min")
@@ -469,16 +543,15 @@ def main(cfg):
     wandb.run.config["val_size"] = len(val_ds)
     wandb.run.config["num_params"] = format(num_params, ",")
 
-    trainer.train(params, state, rng)
+    trainer.train()
     wandb.finish()
 
 
 if __name__ == "__main__":
     """
     Alternatively, use ```
-    jax.config.update("jax_threefry_partitionable", True)
+    jax.config.update("jax_default_prng_impl", "rbg")
     ``` to reduce the communication overhead.
     """
-    jax.config.update("jax_default_prng_impl", "rbg")
-
+    jax.config.update("jax_threefry_partitionable", True)
     main()

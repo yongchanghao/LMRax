@@ -13,6 +13,10 @@ patience: 10
 save_dir: /path/to/save
 save_steps: 1
 seed: 42
+override: false
+reset_status: false
+keep_last: null
+keep_best: null
 
 hydra:
   output_subdir: null
