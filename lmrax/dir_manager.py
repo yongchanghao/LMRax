@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 
 
 class DirManager:
@@ -62,7 +63,7 @@ class DirManager:
         for filename in os.listdir(self.root_dir):
             match = re.match(self.step_pattern, filename)
             if match and int(match.group(1)) in purge_list:
-                os.remove(os.path.join(self.root_dir, filename))
+                shutil.rmtree(os.path.join(self.root_dir, filename))
 
     def purge_worse(self, k=None):
         """
@@ -81,4 +82,4 @@ class DirManager:
         for filename in os.listdir(self.root_dir):
             match = re.match(self.best_pattern, filename)
             if match and float(match.group(1)) in purge_list:
-                os.remove(os.path.join(self.root_dir, filename))
+                shutil.rmtree(os.path.join(self.root_dir, filename))
