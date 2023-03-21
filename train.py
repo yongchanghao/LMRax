@@ -514,11 +514,9 @@ def main(cfg):
         optimizer_cls(**optimizer_cfg),
     ]
     if cfg.max_grad_norm is not None:
-        optimizer_chains.insert(
-            0, optax.clip_by_global_norm(cfg.max_grad_norm)
-        )
+        optimizer_chains.append(optax.clip_by_global_norm(cfg.max_grad_norm))
     elif cfg.max_grad_value is not None:
-        optimizer_chains.insert(0, optax.clip(cfg.max_grad_value))
+        optimizer_chains.append(optax.clip(cfg.max_grad_value))
     optimizer = optax.chain(*optimizer_chains)
 
     trainer = Trainer(
