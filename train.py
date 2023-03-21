@@ -258,7 +258,7 @@ class Trainer:
         if params.get("reward_head", None) is None:
             params = unfreeze(params)
             ndim = self.model.config.d_model
-            params["reward_head"] = jax.random.normal(self.rng, (ndim,)) / ndim
+            params["reward_head"] = jnp.zeros((ndim,))  # last layer
             params = freeze(params)
         params = jax.tree_map(np.asarray, params)
 
