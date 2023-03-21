@@ -187,7 +187,6 @@ class Trainer:
     def __init__(
         self,
         cfg,
-        optimizer,
         train_ds,
         val_ds,
         update_fn,
@@ -197,7 +196,7 @@ class Trainer:
         self.cfg = cfg
         self.train_ds = train_ds
         self.val_ds = val_ds
-        self.optimizer = optimizer
+
         self.steps = 0
         self.epoch = 0
         self.params_updates = 0
@@ -216,6 +215,28 @@ class Trainer:
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
             cfg.model_name
         )
+
+        scheduler_cfg = OmegaConf.to_object(cfg.scheduler)
+        optimizer_cfg = OmegaConf.to_object(cfg.optimizer)
+        scheduler_cls = lmrax.optimizers.get_scheduler(
+            scheduler_cfg.pop("name")
+        )
+
+        self.scheduler = scheduler_cls(**scheduler_cfg)
+
+        optimizer_cls = lmrax.optimizers.get_optimizer(
+            optimizer_cfg.pop("name")
+        )
+        optimizer_chains = [
+            optimizer_cls(self.scheduler, **optimizer_cfg),
+        ]
+        if cfg.max_grad_norm is not None:
+            optimizer_chains.append(
+                optax.clip_by_global_norm(cfg.max_grad_norm)
+            )
+        elif cfg.max_grad_value is not None:
+            optimizer_chains.append(optax.clip(cfg.max_grad_value))
+        self.optimizer = optax.chain(*optimizer_chains)
 
         devices = np.array(jax.devices()).reshape(
             cfg.num_dp_devices, cfg.num_tp_devices
@@ -366,6 +387,7 @@ class Trainer:
             for _ in range(self.steps, len(self.train_loader)):
                 batch = next(iterator)
                 self.steps += 1
+                self.params_updates += 1
                 batch = batch_reshape(
                     batch,
                     self.cfg.batch_size_per_device * self.cfg.num_dp_devices,
@@ -385,12 +407,13 @@ class Trainer:
                     "grad_norm": jax.device_get(grad_norm).mean(),
                     "acc": jax.device_get(acc).mean(),
                     "steps": self.params_updates,
+                    "lr": self.scheduler(self.params_updates),
                 }
                 bar.set_postfix(post_fix)
                 if self.steps % len(self.train_loader) == 0:
                     self.epoch += 1
                     self.steps = 0
-                self.params_updates += 1
+
                 wandb.log(
                     {"train/" + k: v for k, v in post_fix.items()},
                     step=self.params_updates,
@@ -518,21 +541,9 @@ def main(cfg):
         num_proc=mp.cpu_count(),
         load_from_cache_file=False,
     )
-    optimizer_cfg = OmegaConf.to_object(cfg.optimizer)
-    optimizer_cls = lmrax.optimizers.get(optimizer_cfg.pop("name"))
-
-    optimizer_chains = [
-        optimizer_cls(**optimizer_cfg),
-    ]
-    if cfg.max_grad_norm is not None:
-        optimizer_chains.append(optax.clip_by_global_norm(cfg.max_grad_norm))
-    elif cfg.max_grad_value is not None:
-        optimizer_chains.append(optax.clip(cfg.max_grad_value))
-    optimizer = optax.chain(*optimizer_chains)
 
     trainer = Trainer(
         cfg=cfg,
-        optimizer=optimizer,
         train_ds=train_ds,
         val_ds=val_ds,
         update_fn=_update_fn,
