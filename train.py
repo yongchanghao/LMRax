@@ -377,6 +377,7 @@ class Trainer:
             drop_last=drop_last,
             worker_init_fn=seed_worker,
             shuffle=shuffle,
+            num_workers=1,
         )
 
     def train_epoch(self):
