@@ -47,25 +47,31 @@ def predict_fn(params, batch, model, rng=None):
         dropout_rng=encoder_rng,
     )
 
-    chosen_reward = model.decode(
-        params=params,
-        encoder_outputs=encoder_outputs,
-        encoder_attention_mask=context["attention_mask"],
-        decoder_input_ids=chosen["input_ids"],
-        decoder_attention_mask=chosen["attention_mask"],
-        train=training,
-        dropout_rng=chosen_rng,
-    ).last_hidden_state.mean(axis=-1)
+    chosen_reward = (
+        model.decode(
+            params=params,
+            encoder_outputs=encoder_outputs,
+            encoder_attention_mask=context["attention_mask"],
+            decoder_input_ids=chosen["input_ids"],
+            decoder_attention_mask=chosen["attention_mask"],
+            train=training,
+            dropout_rng=chosen_rng,
+        ).last_hidden_state
+        @ params["reward_head"]
+    )
 
-    rejected_reward = model.decode(
-        params=params,
-        encoder_outputs=encoder_outputs,
-        encoder_attention_mask=context["attention_mask"],
-        decoder_input_ids=rejected["input_ids"],
-        decoder_attention_mask=rejected["attention_mask"],
-        train=training,
-        dropout_rng=rejected_rng,
-    ).last_hidden_state.mean(axis=-1)
+    rejected_reward = (
+        model.decode(
+            params=params,
+            encoder_outputs=encoder_outputs,
+            encoder_attention_mask=context["attention_mask"],
+            decoder_input_ids=rejected["input_ids"],
+            decoder_attention_mask=rejected["attention_mask"],
+            train=training,
+            dropout_rng=rejected_rng,
+        ).last_hidden_state
+        @ params["reward_head"]
+    )
 
     chosen_reward = jnp.tanh(chosen_reward)  # (B, L)
     rejected_reward = jnp.tanh(rejected_reward)  # (B, L)
@@ -249,6 +255,11 @@ class Trainer:
         params = self.model.init_weights(
             self.rng, (cfg.batch_size_per_device, cfg.max_length), params
         )
+        if params.get("reward_head", None) is None:
+            params = unfreeze(params)
+            ndim = self.model.config.d_model
+            params["reward_head"] = jnp.zeros((ndim,))  # last layer
+            params = freeze(params)
         params = jax.tree_map(np.asarray, params)
 
         none_shd = shd.NamedSharding(self.mesh, shd.PartitionSpec())
@@ -430,7 +441,7 @@ class Trainer:
         with open(status_path, "wb") as f:
             pickle.dump(status_dict, f)
 
-        if os.path.exists(os.path.join(self.cfg.save_dir, "model_last")):
+        if os.path.lexists(os.path.join(self.cfg.save_dir, "model_last")):
             os.unlink(os.path.join(self.cfg.save_dir, "model_last"))
         os.symlink(
             os.path.abspath(os.path.join(self.cfg.save_dir, name)),
