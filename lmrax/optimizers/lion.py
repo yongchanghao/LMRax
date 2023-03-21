@@ -20,6 +20,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import optax
+from optax._src.transform import bias_correction
 
 
 def _scale_by_learning_rate(
@@ -106,8 +107,14 @@ def scale_by_lion(
         mu = update_moment(updates, state.mu, b2, 1)
         mu = jax.tree_map(lambda x: x.astype(mu_dtype), mu)
         count_inc = optax.safe_int32_increment(state.count)
+        # updates = jax.tree_util.tree_map(
+        #     lambda g, m: jnp.sign((1.0 - b1) * g + b1 * m), updates, state.mu
+        # )
+        # moment, decay, count
+        mu_hat = bias_correction(mu, b2, count_inc)
         updates = jax.tree_util.tree_map(
-            lambda g, m: jnp.sign((1.0 - b1) * g + b1 * m), updates, state.mu
+            # lambda g, m: jnp.sign((1.0 - b1) * g + b1 * m), updates, state.mu
+            lambda g, m: jnp.sign(m + b2 / b1 * g - g), updates, mu_hat
         )
         return updates, ScaleByLionState(count=count_inc, mu=mu)
 
