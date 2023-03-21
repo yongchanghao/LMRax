@@ -16,7 +16,7 @@ seed: 42
 override: false
 reset_status: false
 keep_last: null
-keep_best: null
+keep_best: 10
 
 hydra:
   output_subdir: null

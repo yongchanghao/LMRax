@@ -232,12 +232,12 @@ class Trainer:
             )
             path = self.cfg.model_name
         elif self.dmgr.last_model is not None:
-            self.logger.warning(
+            self.logger.info(
                 f"Loading previous checkpoint from {self.dmgr.last_model}"
             )
             path = self.dmgr.last_model
         else:
-            self.logger.warning(f"Loading model from {self.cfg.model_name}")
+            self.logger.info(f"Loading model from {self.cfg.model_name}")
             path = self.cfg.model_name
 
         self.model, params = transformers.FlaxAutoModel.from_pretrained(
@@ -393,10 +393,9 @@ class Trainer:
                     improved, self.es = self.es.update(-results["acc"])
                     if self.es.should_stop:
                         return True
-                    elif improved:
-                        self.save(
-                            f"model_best_acc_{results['acc']:.4f}",
-                        )
+                    self.save(
+                        f"model_best_acc_{results['acc']:.4f}",
+                    )
                 if self.params_updates % self.cfg.save_steps == 0:
                     self.save(f"model_{self.params_updates}")
                 if self.params_updates >= self.cfg.max_updates:
