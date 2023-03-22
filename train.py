@@ -279,7 +279,9 @@ class Trainer:
         if params.get("reward_head", None) is None:
             params = unfreeze(params)
             ndim = self.model.config.d_model
-            params["reward_head"] = jnp.zeros((ndim,))  # last layer
+            params["reward_head"] = (
+                jax.random.normal(self.rng, (ndim,)) / ndim
+            )
             params = freeze(params)
         params = jax.tree_map(np.asarray, params)
 
@@ -408,7 +410,7 @@ class Trainer:
                     "grad_norm": jax.device_get(grad_norm).mean(),
                     "acc": jax.device_get(acc).mean(),
                     "steps": self.params_updates,
-                    "lr": self.scheduler(self.params_updates),
+                    "lr": jax.device_get(self.scheduler(self.params_updates)),
                 }
                 bar.set_postfix(post_fix)
                 if self.steps % len(self.train_loader) == 0:
