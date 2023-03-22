@@ -1,6 +1,6 @@
 name: lion
-learning_rate: 1.0e-4
 b1: 0.9
 b2: 0.99
-weight_decay: 1.0e-3
+weight_decay: 0.0
 mu_dtype: bfloat16
+bias_correction: true

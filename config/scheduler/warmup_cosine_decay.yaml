@@ -1,0 +1,6 @@
+name: warmup_cosine_decay
+init_value: 1.0e-7
+peak_value: 1.0e-4
+warmup_steps: 1000
+decay_steps: 100000
+end_value: 1.0e-7

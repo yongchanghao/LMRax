@@ -38,6 +38,7 @@ def lion(
     b2: float = 0.99,
     mu_dtype: Optional[Any] = None,
     weight_decay: float = 0.0,
+    bias_correction: bool = False,
     mask: Optional[Union[Any, Callable[[optax.Params], Any]]] = None,
 ) -> optax.GradientTransformation:
     """Lion.
@@ -61,7 +62,7 @@ def lion(
       The corresponding `GradientTransformation`.
     """
     return optax.chain(
-        scale_by_lion(b1=b1, b2=b2, mu_dtype=mu_dtype),
+        scale_by_lion(b1=b1, b2=b2, mu_dtype=mu_dtype, bc=bias_correction),
         optax.add_decayed_weights(weight_decay, mask),
         _scale_by_learning_rate(learning_rate),
     )
@@ -85,6 +86,7 @@ def scale_by_lion(
     b1: float = 0.9,
     b2: float = 0.99,
     mu_dtype: Optional[Any] = None,
+    bc: bool = False,
 ) -> optax.GradientTransformation:
     """Rescale updates according to the Lion algorithm.
     Args:
@@ -107,15 +109,19 @@ def scale_by_lion(
         mu = update_moment(updates, state.mu, b2, 1)
         mu = jax.tree_map(lambda x: x.astype(mu_dtype), mu)
         count_inc = optax.safe_int32_increment(state.count)
-        # updates = jax.tree_util.tree_map(
-        #     lambda g, m: jnp.sign((1.0 - b1) * g + b1 * m), updates, state.mu
-        # )
-        # moment, decay, count
-        mu_hat = bias_correction(mu, b2, count_inc)
-        updates = jax.tree_util.tree_map(
-            # lambda g, m: jnp.sign((1.0 - b1) * g + b1 * m), updates, state.mu
-            lambda g, m: jnp.sign(m + b2 / b1 * g - g), updates, mu_hat
-        )
+        if bc:
+            mu_hat = bias_correction(mu, b2, count_inc)
+            updates = jax.tree_util.tree_map(
+                lambda g, m: jnp.sign(m + b2 / b1 * g - g),
+                updates,
+                mu_hat,
+            )
+        else:
+            updates = jax.tree_util.tree_map(
+                lambda g, m: jnp.sign((1.0 - b1) * g + b1 * m),
+                updates,
+                state.mu,
+            )
         return updates, ScaleByLionState(count=count_inc, mu=mu)
 
     return optax.GradientTransformation(init_fn, update_fn)

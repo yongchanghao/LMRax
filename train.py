@@ -47,25 +47,31 @@ def predict_fn(params, batch, model, rng=None):
         dropout_rng=encoder_rng,
     )
 
-    chosen_reward = model.decode(
-        params=params,
-        encoder_outputs=encoder_outputs,
-        encoder_attention_mask=context["attention_mask"],
-        decoder_input_ids=chosen["input_ids"],
-        decoder_attention_mask=chosen["attention_mask"],
-        train=training,
-        dropout_rng=chosen_rng,
-    ).last_hidden_state.mean(axis=-1)
+    chosen_reward = (
+        model.decode(
+            params=params,
+            encoder_outputs=encoder_outputs,
+            encoder_attention_mask=context["attention_mask"],
+            decoder_input_ids=chosen["input_ids"],
+            decoder_attention_mask=chosen["attention_mask"],
+            train=training,
+            dropout_rng=chosen_rng,
+        ).last_hidden_state
+        @ params["reward_head"]
+    )
 
-    rejected_reward = model.decode(
-        params=params,
-        encoder_outputs=encoder_outputs,
-        encoder_attention_mask=context["attention_mask"],
-        decoder_input_ids=rejected["input_ids"],
-        decoder_attention_mask=rejected["attention_mask"],
-        train=training,
-        dropout_rng=rejected_rng,
-    ).last_hidden_state.mean(axis=-1)
+    rejected_reward = (
+        model.decode(
+            params=params,
+            encoder_outputs=encoder_outputs,
+            encoder_attention_mask=context["attention_mask"],
+            decoder_input_ids=rejected["input_ids"],
+            decoder_attention_mask=rejected["attention_mask"],
+            train=training,
+            dropout_rng=rejected_rng,
+        ).last_hidden_state
+        @ params["reward_head"]
+    )
 
     chosen_reward = jnp.tanh(chosen_reward)  # (B, L)
     rejected_reward = jnp.tanh(rejected_reward)  # (B, L)
@@ -181,7 +187,6 @@ class Trainer:
     def __init__(
         self,
         cfg,
-        optimizer,
         train_ds,
         val_ds,
         update_fn,
@@ -191,7 +196,7 @@ class Trainer:
         self.cfg = cfg
         self.train_ds = train_ds
         self.val_ds = val_ds
-        self.optimizer = optimizer
+
         self.steps = 0
         self.epoch = 0
         self.params_updates = 0
@@ -210,6 +215,28 @@ class Trainer:
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
             cfg.model_name
         )
+
+        scheduler_cfg = OmegaConf.to_object(cfg.scheduler)
+        optimizer_cfg = OmegaConf.to_object(cfg.optimizer)
+        scheduler_cls = lmrax.optimizers.get_scheduler(
+            scheduler_cfg.pop("name")
+        )
+
+        self.scheduler = scheduler_cls(**scheduler_cfg)
+
+        optimizer_cls = lmrax.optimizers.get_optimizer(
+            optimizer_cfg.pop("name")
+        )
+        optimizer_chains = [
+            optimizer_cls(self.scheduler, **optimizer_cfg),
+        ]
+        if cfg.max_grad_norm is not None:
+            optimizer_chains.append(
+                optax.clip_by_global_norm(cfg.max_grad_norm)
+            )
+        elif cfg.max_grad_value is not None:
+            optimizer_chains.append(optax.clip(cfg.max_grad_value))
+        self.optimizer = optax.chain(*optimizer_chains)
 
         devices = np.array(jax.devices()).reshape(
             cfg.num_dp_devices, cfg.num_tp_devices
@@ -249,6 +276,13 @@ class Trainer:
         params = self.model.init_weights(
             self.rng, (cfg.batch_size_per_device, cfg.max_length), params
         )
+        if params.get("reward_head", None) is None:
+            params = unfreeze(params)
+            ndim = self.model.config.d_model
+            params["reward_head"] = (
+                jax.random.normal(self.rng, (ndim,)) / ndim
+            )
+            params = freeze(params)
         params = jax.tree_map(np.asarray, params)
 
         none_shd = shd.NamedSharding(self.mesh, shd.PartitionSpec())
@@ -345,6 +379,7 @@ class Trainer:
             drop_last=drop_last,
             worker_init_fn=seed_worker,
             shuffle=shuffle,
+            num_workers=1,
         )
 
     def train_epoch(self):
@@ -355,6 +390,7 @@ class Trainer:
             for _ in range(self.steps, len(self.train_loader)):
                 batch = next(iterator)
                 self.steps += 1
+                self.params_updates += 1
                 batch = batch_reshape(
                     batch,
                     self.cfg.batch_size_per_device * self.cfg.num_dp_devices,
@@ -374,12 +410,13 @@ class Trainer:
                     "grad_norm": jax.device_get(grad_norm).mean(),
                     "acc": jax.device_get(acc).mean(),
                     "steps": self.params_updates,
+                    "lr": jax.device_get(self.scheduler(self.params_updates)),
                 }
                 bar.set_postfix(post_fix)
                 if self.steps % len(self.train_loader) == 0:
                     self.epoch += 1
                     self.steps = 0
-                self.params_updates += 1
+
                 wandb.log(
                     {"train/" + k: v for k, v in post_fix.items()},
                     step=self.params_updates,
@@ -430,7 +467,7 @@ class Trainer:
         with open(status_path, "wb") as f:
             pickle.dump(status_dict, f)
 
-        if os.path.exists(os.path.join(self.cfg.save_dir, "model_last")):
+        if os.path.lexists(os.path.join(self.cfg.save_dir, "model_last")):
             os.unlink(os.path.join(self.cfg.save_dir, "model_last"))
         os.symlink(
             os.path.abspath(os.path.join(self.cfg.save_dir, name)),
@@ -507,21 +544,9 @@ def main(cfg):
         num_proc=mp.cpu_count(),
         load_from_cache_file=False,
     )
-    optimizer_cfg = OmegaConf.to_object(cfg.optimizer)
-    optimizer_cls = lmrax.optimizers.get(optimizer_cfg.pop("name"))
-
-    optimizer_chains = [
-        optimizer_cls(**optimizer_cfg),
-    ]
-    if cfg.max_grad_norm is not None:
-        optimizer_chains.append(optax.clip_by_global_norm(cfg.max_grad_norm))
-    elif cfg.max_grad_value is not None:
-        optimizer_chains.append(optax.clip(cfg.max_grad_value))
-    optimizer = optax.chain(*optimizer_chains)
 
     trainer = Trainer(
         cfg=cfg,
-        optimizer=optimizer,
         train_ds=train_ds,
         val_ds=val_ds,
         update_fn=_update_fn,
