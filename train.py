@@ -4,6 +4,8 @@ import os
 import pickle
 from functools import partial
 
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
 import datasets
 import hydra
 import jax
@@ -17,15 +19,14 @@ import transformers
 import wandb
 from flax.core.frozen_dict import freeze, unfreeze
 from flax.training.early_stopping import EarlyStopping
-from jax.experimental.pjit import pjit
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
 
 import lmrax.optimizers
-from lmrax.datasets.preference_feedback import FlaxDataCollatorForSeq2SeqPF
-from lmrax.datasets.utils import seed_worker
+from lmrax.datasets.utils import seed_worker, preprocess_function, data_loader
 from lmrax.dir_manager import DirManager
 from lmrax.sharding import get_batch_shardings, get_params_shardings
+
+datasets.disable_caching()
 
 
 def predict_fn(params, batch, model, rng=None):
@@ -35,14 +36,11 @@ def predict_fn(params, batch, model, rng=None):
     else:
         training = True
         encoder_rng, chosen_rng, rejected_rng = jax.random.split(rng, 3)
-    context = batch["context"]
-    chosen = batch["chosen"]
-    rejected = batch["rejected"]
 
     encoder_outputs = model.encode(
         params=params,
-        input_ids=context["input_ids"],
-        attention_mask=context["attention_mask"],
+        input_ids=batch["context_input_ids"],
+        attention_mask=batch["context_attention_mask"],
         train=training,
         dropout_rng=encoder_rng,
     )
@@ -51,9 +49,9 @@ def predict_fn(params, batch, model, rng=None):
         model.decode(
             params=params,
             encoder_outputs=encoder_outputs,
-            encoder_attention_mask=context["attention_mask"],
-            decoder_input_ids=chosen["input_ids"],
-            decoder_attention_mask=chosen["attention_mask"],
+            encoder_attention_mask=batch["context_attention_mask"],
+            decoder_input_ids=batch["chosen_input_ids"],
+            decoder_attention_mask=batch["chosen_attention_mask"],
             train=training,
             dropout_rng=chosen_rng,
         ).last_hidden_state
@@ -64,9 +62,9 @@ def predict_fn(params, batch, model, rng=None):
         model.decode(
             params=params,
             encoder_outputs=encoder_outputs,
-            encoder_attention_mask=context["attention_mask"],
-            decoder_input_ids=rejected["input_ids"],
-            decoder_attention_mask=rejected["attention_mask"],
+            encoder_attention_mask=batch["context_attention_mask"],
+            decoder_input_ids=batch["rejected_input_ids"],
+            decoder_attention_mask=batch["rejected_attention_mask"],
             train=training,
             dropout_rng=rejected_rng,
         ).last_hidden_state
@@ -77,33 +75,23 @@ def predict_fn(params, batch, model, rng=None):
     rejected_reward = jnp.tanh(rejected_reward)  # (B, L)
 
     # mask out paddings
-    chosen_reward = jnp.where(
-        chosen["attention_mask"] == 0, 0.0, chosen_reward
-    )  # (B, L)
+    chosen_reward = jnp.where(batch["chosen_attention_mask"] == 0, 0.0, chosen_reward)  # (B, L)
 
-    rejected_reward = jnp.where(
-        rejected["attention_mask"] == 0, 0.0, rejected_reward
-    )  # (B, L)
+    rejected_reward = jnp.where(batch["rejected_attention_mask"] == 0, 0.0, rejected_reward)  # (B, L)
 
     chosen_score = jnp.sum(chosen_reward, axis=-1)  # (B,)
     rejected_score = jnp.sum(rejected_reward, axis=-1)  # (B,)
 
     log_prob_chosen = jax.nn.log_sigmoid(chosen_score - rejected_score)  # (B,)
-    log_prob_rejected = jax.nn.log_sigmoid(
-        rejected_score - chosen_score
-    )  # (B,)
+    log_prob_rejected = jax.nn.log_sigmoid(rejected_score - chosen_score)  # (B,)
 
     return log_prob_chosen, log_prob_rejected
 
 
 def loss_fn(params, batch, dropout_rng, model):
     weight = batch["weight"]
-    log_prob_chosen, log_prob_rejected = predict_fn(
-        params, batch, model, dropout_rng
-    )
-    loss = -jnp.mean(
-        weight * log_prob_chosen + (1 - weight) * log_prob_rejected
-    )
+    log_prob_chosen, log_prob_rejected = predict_fn(params, batch, model, dropout_rng)
+    loss = -jnp.mean(weight * log_prob_chosen + (1 - weight) * log_prob_rejected)
     acc = jnp.mean(log_prob_chosen > log_prob_rejected)
 
     return loss, acc
@@ -136,13 +124,9 @@ def _update_fn(model, optimizer, rng, batch, params, state, cfg=None):
 
     loss = loss.astype(jnp.float32) / cfg.gradient_accumulation
     acc = acc.astype(jnp.float32) / cfg.gradient_accumulation
-    grad_norm = (
-        grad_norm_fn(updates).astype(jnp.float32) / cfg.gradient_accumulation
-    )
+    grad_norm = grad_norm_fn(updates).astype(jnp.float32) / cfg.gradient_accumulation
 
-    updates = jax.tree_map(
-        lambda x: x.astype(jnp.float32) / cfg.gradient_accumulation, updates
-    )
+    updates = jax.tree_map(lambda x: x.astype(jnp.float32) / cfg.gradient_accumulation, updates)
 
     updates, state = optimizer.update(updates, state, params)
     params = optax.apply_updates(params, updates)
@@ -200,11 +184,7 @@ class Trainer:
         self.steps = 0
         self.epoch = 0
         self.params_updates = 0
-        self.batch_size = (
-            cfg.batch_size_per_device
-            * cfg.num_dp_devices
-            * cfg.gradient_accumulation
-        )
+        self.batch_size = cfg.batch_size_per_device * cfg.num_dp_devices * cfg.gradient_accumulation
         self.eval_batch_size = cfg.batch_size_per_device * cfg.num_dp_devices
         self.max_length = cfg.max_length
 
@@ -212,76 +192,55 @@ class Trainer:
             patience=cfg.patience,
         )
         self.rng = jax.tree_map(np.asarray, jax.random.PRNGKey(cfg.seed))
-        self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-            cfg.model_name
-        )
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(cfg.model_name)
 
         scheduler_cfg = OmegaConf.to_object(cfg.scheduler)
         optimizer_cfg = OmegaConf.to_object(cfg.optimizer)
-        scheduler_cls = lmrax.optimizers.get_scheduler(
-            scheduler_cfg.pop("name")
-        )
+        scheduler_cls = lmrax.optimizers.get_scheduler(scheduler_cfg.pop("name"))
 
         self.scheduler = scheduler_cls(**scheduler_cfg)
 
-        optimizer_cls = lmrax.optimizers.get_optimizer(
-            optimizer_cfg.pop("name")
-        )
+        optimizer_cls = lmrax.optimizers.get_optimizer(optimizer_cfg.pop("name"))
         optimizer_chains = [
             optimizer_cls(self.scheduler, **optimizer_cfg),
         ]
         if cfg.max_grad_norm is not None:
-            optimizer_chains.append(
-                optax.clip_by_global_norm(cfg.max_grad_norm)
-            )
+            optimizer_chains.append(optax.clip_by_global_norm(cfg.max_grad_norm))
         elif cfg.max_grad_value is not None:
             optimizer_chains.append(optax.clip(cfg.max_grad_value))
         self.optimizer = optax.chain(*optimizer_chains)
 
-        devices = np.array(jax.devices()).reshape(
-            cfg.num_dp_devices, cfg.num_tp_devices
-        )
+        devices = np.array(jax.devices()).reshape(cfg.num_dp_devices, cfg.num_tp_devices)
 
         # dp: data parallel, tp: tensor parallel
         self.mesh = shd.Mesh(devices, ("dp", "tp"))
 
         self.train_loader = self.get_dataloader(self.train_ds, drop_last=True)
-        self.val_loader = self.get_dataloader(
-            self.val_ds, batch_size=self.eval_batch_size, shuffle=False
-        )
+        self.val_loader = self.get_dataloader(self.val_ds, batch_size=self.eval_batch_size, shuffle=False)
 
         self.dmgr = DirManager(cfg.save_dir, maximize=True)
 
         if cfg.override:
             self.logger.warning(
-                f"Overriding previous checkpoint under {cfg.save_dir}\n"
-                + f"Loading model from f{cfg.model_name}"
+                f"Overriding previous checkpoint under {cfg.save_dir}\n" + f"Loading model from f{cfg.model_name}"
             )
             path = self.cfg.model_name
         elif self.dmgr.last_model is not None:
-            self.logger.info(
-                f"Loading previous checkpoint from {self.dmgr.last_model}"
-            )
+            self.logger.info(f"Loading previous checkpoint from {self.dmgr.last_model}")
             path = self.dmgr.last_model
         else:
             self.logger.info(f"Loading model from {self.cfg.model_name}")
             path = self.cfg.model_name
 
-        self.model, params = transformers.FlaxAutoModel.from_pretrained(
-            path, _do_init=False, dtype=jnp.bfloat16
-        )
+        self.model, params = transformers.FlaxAutoModel.from_pretrained(path, _do_init=False, dtype=jnp.bfloat16)
 
         batch = next(iter(self.train_loader))
 
-        params = self.model.init_weights(
-            self.rng, (cfg.batch_size_per_device, cfg.max_length), params
-        )
+        params = self.model.init_weights(self.rng, (cfg.batch_size_per_device, cfg.max_length), params)
         if params.get("reward_head", None) is None:
             params = unfreeze(params)
             ndim = self.model.config.d_model
-            params["reward_head"] = (
-                jax.random.normal(self.rng, (ndim,)) / ndim
-            )
+            params["reward_head"] = jax.random.normal(self.rng, (ndim,)) / ndim
             params = freeze(params)
         params = jax.tree_map(np.asarray, params)
 
@@ -310,9 +269,7 @@ class Trainer:
         state_shardings = jax.tree_util.tree_map(
             get_state_shardings,
             self.state,
-            is_leaf=lambda x: isinstance(
-                unfreeze(x), (dict, optax.EmptyState)
-            ),
+            is_leaf=lambda x: isinstance(unfreeze(x), (dict, optax.EmptyState)),
         )
 
         self.state = jax.device_put(self.state, state_shardings)
@@ -336,15 +293,15 @@ class Trainer:
                 cfg,
             )
 
-        self.update_fn = pjit(
+        self.update_fn = jax.jit(
             wrapped_update_fn,
-            in_axis_resources=(
+            in_shardings=(
                 none_shd,  # rng
                 batch_shardings,  # batch
                 params_shardings,  # params
                 state_shardings,  # state
             ),
-            out_axis_resources=(
+            out_shardings=(
                 none_shd,  # loss
                 none_shd,  # acc
                 params_shardings,  # params
@@ -354,41 +311,32 @@ class Trainer:
             ),
         )
 
-        self.eval_fn = pjit(
+        self.eval_fn = jax.jit(
             wrapped_eval_fn,
-            in_axis_resources=(params_shardings, batch_shardings),
-            out_axis_resources=(none_shd, none_shd),
+            in_shardings=(params_shardings, batch_shardings),
+            out_shardings=(none_shd, none_shd),
         )
 
-    def get_data_collator(self):
-        return FlaxDataCollatorForSeq2SeqPF(
-            tokenizer=self.tokenizer,
-            padding="max_length",
-            max_length=self.max_length,
-            truncation=True,
-        )
-
-    def get_dataloader(
-        self, ds, batch_size=None, shuffle=True, drop_last=False
-    ):
-        return DataLoader(
-            ds,
+    def get_dataloader(self, ds, batch_size=None, shuffle=False, drop_last=True):
+        batch_size = batch_size or self.batch_size
+        if drop_last:
+            self.epoch_length = len(ds) // batch_size
+        else:
+            self.epoch_length = (len(ds) + batch_size - 1) // batch_size
+        return data_loader(
+            rng=self.rng,
+            dataset=ds,
             batch_size=batch_size or self.batch_size,
-            collate_fn=self.get_data_collator(),
-            pin_memory=False,
-            drop_last=drop_last,
-            worker_init_fn=seed_worker,
             shuffle=shuffle,
-            num_workers=1,
+            drop_last=drop_last,
         )
 
     def train_epoch(self):
-        with tqdm.tqdm(self.train_loader, desc=f"Epoch {self.epoch}") as bar:
-            iterator = iter(bar)
+        with tqdm.tqdm(range(self.epoch_length), desc=f"Epoch {self.epoch}", position=self.steps) as bar:
             for _ in range(self.steps):
-                next(iterator)
-            for _ in range(self.steps, len(self.train_loader)):
-                batch = next(iterator)
+                next(self.train_loader)
+            for _ in range(self.steps, self.epoch_length):
+                batch = next(self.train_loader)
                 self.steps += 1
                 self.params_updates += 1
                 batch = batch_reshape(
@@ -413,7 +361,8 @@ class Trainer:
                     "lr": jax.device_get(self.scheduler(self.params_updates)),
                 }
                 bar.set_postfix(post_fix)
-                if self.steps % len(self.train_loader) == 0:
+
+                if self.steps % self.epoch_length == 0:
                     self.epoch += 1
                     self.steps = 0
 
@@ -437,13 +386,12 @@ class Trainer:
                     self.save(f"model_{self.params_updates}")
                 if self.params_updates >= self.cfg.max_updates:
                     return True
+                bar.update()
         return False
 
     def save(self, name):
         def cast_to_fp32(param):
-            if isinstance(param, jnp.ndarray) and jnp.issubdtype(
-                param.dtype, jnp.floating
-            ):
+            if isinstance(param, jnp.ndarray) and jnp.issubdtype(param.dtype, jnp.floating):
                 param = param.astype(jnp.float32)
             return np.asarray(param)
 
@@ -529,11 +477,28 @@ def main(cfg):
         lmrax.datasets.utils.get_filter_fn(cfg),
         num_proc=mp.cpu_count(),
     )
+    # train_ds = train_ds.map(
+    #     lmrax.datasets.utils.get_map_fn(cfg),
+    #     remove_columns=train_ds.features.keys(),
+    #     num_proc=mp.cpu_count(),
+    #     load_from_cache_file=False,
+    # )
+
+    def wrapped_preprocess_function(examples):
+        return preprocess_function(
+            examples,
+            cfg,
+            tokenizer=transformers.AutoTokenizer.from_pretrained(cfg.model_name),
+            max_source_length=cfg.max_length,
+            max_target_length=cfg.max_length,
+        )
+
     train_ds = train_ds.map(
-        lmrax.datasets.utils.get_map_fn(cfg),
-        remove_columns=train_ds.features.keys(),
+        wrapped_preprocess_function,
+        batched=True,
         num_proc=mp.cpu_count(),
         load_from_cache_file=False,
+        remove_columns=train_ds.features.keys(),
     )
 
     val_ds = datasets.load_dataset(cfg.dataset.name, split=cfg.dataset.val)
@@ -541,6 +506,7 @@ def main(cfg):
     val_ds = val_ds.map(
         lmrax.datasets.utils.get_map_fn(cfg),
         remove_columns=val_ds.features.keys(),
+        batched=True,
         num_proc=mp.cpu_count(),
         load_from_cache_file=False,
     )
