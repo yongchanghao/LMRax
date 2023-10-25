@@ -1,5 +1,5 @@
 batch_size_per_device: 1
-eval_steps: 100
+eval_steps: 1000
 gradient_accumulation: 1
 max_epochs: 100
 max_grad_norm: null
@@ -11,7 +11,7 @@ num_dp_devices: 1
 num_tp_devices: 1
 patience: 10
 save_dir: /path/to/save
-save_steps: 1
+save_steps: 1000
 seed: 42
 override: false
 reset_status: false
@@ -26,4 +26,5 @@ hydra:
 default:
   - _self_
   - optimizer: optimizer name
+  - scheduler: scheduler name
   - dataset: dataset name
